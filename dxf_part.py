@@ -112,8 +112,8 @@ class NGnetConfig:
     r_max: float
     theta_min: float
     theta_max: float
-    n_radial: int = 6
-    n_angular: int = 5
+    n_radial: int = 9
+    n_angular: int = 6
 
 
 class NGnet:
@@ -125,7 +125,7 @@ class NGnet:
         r_vals = np.linspace(cfg.r_min, cfg.r_max, cfg.n_radial)
         t_vals = np.linspace(cfg.theta_min, cfg.theta_max, cfg.n_angular)
         dr = (cfg.r_max - cfg.r_min) / max(cfg.n_radial - 1, 1)
-        self.sigma = dr * 0.5
+        self.sigma = dr * 0.8
         for r in r_vals:
             for t in t_vals:
                 self.centers.append((r * np.cos(t), r * np.sin(t)))
@@ -473,7 +473,7 @@ def main(tra_path: str, output_dir: str = "."):
         n_angular=5,
     )
     ngnet = NGnet(config)
-    ngnet.set_random_weights(seed=42)
+    ngnet.set_random_weights(seed=3)
     
     # Assign materials
     print("\n3. Assigning materials...")
