@@ -1,8 +1,21 @@
 # plot_fem.py - Import DXF vào FEMM và tự động đặt block labels
 import json
+import math
 from pathlib import Path
 
 import femm
+
+
+def calculate_phase_currents(Im=11, ini=-15, adv=35):
+    angle_a = ini + 90 + adv
+    angle_b = ini + 90 + adv - 120
+    angle_c = ini + 90 + adv + 120
+
+    i_a = Im * math.cos(math.radians(angle_a))
+    i_b = Im * math.cos(math.radians(angle_b))
+    i_c = Im * math.cos(math.radians(angle_c))
+
+    return i_a, i_b, i_c
 
 
 def create_model_with_rotor(
@@ -48,6 +61,24 @@ def create_model_with_rotor(
     # Mở file gốc
     femm.opendocument(base_path.as_posix())
 
+    # Tính và set dòng điện 3 pha theo phương trình
+    Im = 11      # Biên độ dòng điện (A)
+    ini = -15    # Góc ban đầu (độ)                                                          #change here
+    adv = 35     # Control angle (độ)
+
+    i_a, i_b, i_c = calculate_phase_currents(Im, ini, adv)
+    print(f"\n=== DONG DIEN 3 PHA ===")
+    print(f"  Im = {Im} A, ini = {ini}°, adv = {adv}°")
+    print(f"  i_a = {i_a:.4f} A")
+    print(f"  i_b = {i_b:.4f} A")
+    print(f"  i_c = {i_c:.4f} A")
+
+    # Gán dòng điện vào các circuit (propnum=1 = total current)
+    femm.mi_modifycircprop("PhaseA", 1, i_a)
+    femm.mi_modifycircprop("PhaseB", 1, i_b)
+    femm.mi_modifycircprop("PhaseC", 1, i_c)
+    print("  -> Da gan dong dien vao circuit PhaseA, PhaseB, PhaseC")
+
     # Vật liệu Air và M350_50A đã có sẵn trong file FEM gốc
     # Không cần gọi mi_getmaterial
 
@@ -55,24 +86,25 @@ def create_model_with_rotor(
     print(f"Importing DXF: {dxf_path}")
     femm.mi_readdxf(dxf_path.as_posix())
 
-    # Đặt block labels cho AIR
+    # Đặt block labels cho AIR - gán vào group 2 để tính torque
     # Tọa độ trong JSON đã là mm (cùng đơn vị với DXF và FEMM)
-    print("Placing AIR block labels...")
+    print("Placing AIR block labels (group 2)...")
     for pt in air_points:
         x, y = pt["x"], pt["y"]
         femm.mi_addblocklabel(x, y)
         femm.mi_selectlabel(x, y)
-        femm.mi_setblockprop("Air", 0, 6, "<None>", 0, 0, 0)
+        # mi_setblockprop(blockname, automesh, meshsize, incircuit, magdir, group, turns)
+        femm.mi_setblockprop("Air", 0, 6, "<None>", 0, 2, 0)
         femm.mi_clearselected()
 
-    # Đặt block labels cho IRON (M350_50A, mesh size 4)
-    print("Placing IRON block labels (M350_50A)...")
+    # Đặt block labels cho IRON (M350_50A, mesh size 4) - gán vào group 2
+    print("Placing IRON block labels (M350_50A, group 2)...")
     for pt in iron_points:
         x, y = pt["x"], pt["y"]
         femm.mi_addblocklabel(x, y)
         femm.mi_selectlabel(x, y)
         # mi_setblockprop(blockname, automesh, meshsize, incircuit, magdir, group, turns)
-        femm.mi_setblockprop("M350_50A", 0, 4, "<None>", 0, 0, 0)
+        femm.mi_setblockprop("M350_50A", 0, 4, "<None>", 0, 2, 0)
         femm.mi_clearselected()
 
     # Tạo Anti-periodic boundary conditions
@@ -123,13 +155,33 @@ def create_model_with_rotor(
     print(f"  - AIR blocks: {len(air_points)}")
     print(f"  - IRON blocks: {len(iron_points)} (M350_50A, mesh=4)")
     print(f"  - Anti-periodic boundaries: {len(boundary_pairs)}")
-    return output_fem
+
+    # Chạy analyze và tính torque cho group 2
+    print("\n=== TINH TORQUE ===")
+    print("Running analysis...")
+    femm.mi_analyze()
+    femm.mi_loadsolution()
+
+    # Chọn tất cả block trong group 2 và tính torque
+    femm.mo_groupselectblock(2)
+
+    # Tính torque bằng weighted stress tensor (type 22)
+    torque = femm.mo_blockintegral(22)
+    print(f"\nTorque (group 2) = {torque} N.m")
+
+    # Clear selection
+    femm.mo_clearblock()
+
+    return output_fem, torque
 
 
 if __name__ == "__main__":
-    create_model_with_rotor(
+    output_file, torque = create_model_with_rotor(
         base_fem="basic.FEM",
         rotor_dxf="combined_regions.dxf",
         centroids_json="centroids.json",
     )
-    input("Nhan Enter de dong FEMM...")
+    print(f"\n=== KET QUA ===")
+    print(f"Output file: {output_file}")
+    print(f"Torque: {torque} N.m")
+    input("\nNhan Enter de dong FEMM...")
