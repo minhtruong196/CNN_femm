@@ -179,6 +179,45 @@ def element_to_polygon(elem, nodes, scale):
         return None
 
 
+def mirror_mesh(nodes: Dict[int, Tuple[float, float]], elements: List[Tri6Element]):
+    """Mirror mesh across y=x line: (x,y) -> (y,x).
+
+    Returns:
+        Tuple[mirrored_nodes, mirrored_elements]: New nodes and elements with mirrored coordinates.
+        Node IDs in mirrored mesh are offset by max_node_id to avoid conflicts.
+    """
+    if not nodes:
+        return {}, []
+
+    # Offset for new node IDs
+    max_node_id = max(nodes.keys())
+    offset = max_node_id + 1
+
+    # Mirror nodes: (x, y) -> (y, x)
+    mirrored_nodes = {}
+    for nid, (x, y) in nodes.items():
+        new_nid = nid + offset
+        mirrored_nodes[new_nid] = (y, x)  # Swap x and y
+
+    # Mirror elements: update node references
+    mirrored_elements = []
+    for e in elements:
+        new_elem = Tri6Element(
+            eid=e.eid + len(elements),
+            region=e.region,
+            n1=e.n1 + offset,
+            n2=e.n2 + offset,
+            n3=e.n3 + offset,
+            n4=e.n4 + offset,
+            n5=e.n5 + offset,
+            n6=e.n6 + offset,
+            material=e.material,  # Copy material from original
+        )
+        mirrored_elements.append(new_elem)
+
+    return mirrored_nodes, mirrored_elements
+
+
 def mirror_polygon_45(poly):
     """Mirror across y=x line: (x,y) -> (y,x)"""
     if poly.is_empty or not poly.is_valid:
@@ -429,6 +468,98 @@ def create_boundary_segments(elements: List[Tri6Element], nodes: Dict[int, Tuple
     return boundary_pairs
 
 
+def extract_boundary_nodes_on_axis(elements: List[Tri6Element], nodes: Dict[int, Tuple[float, float]],
+                                    axis: str, tol: float = 1e-9) -> List[Tuple[float, float]]:
+    """Extract CORNER nodes on specified axis.
+
+    Args:
+        axis: 'x' for X-axis (y≈0), 'y' for Y-axis (x≈0)
+
+    Returns sorted list of (x, y) tuples.
+    """
+    corner_node_ids = set()
+    for e in elements:
+        corner_node_ids.update(e.corner_nodes)
+
+    axis_nodes = []
+    for nid in corner_node_ids:
+        x, y = nodes[nid]
+        if axis == 'x':
+            if abs(y) < tol and x > tol:  # On X-axis, x > 0
+                axis_nodes.append((x, y))
+        elif axis == 'y':
+            if abs(x) < tol and y > tol:  # On Y-axis, y > 0
+                axis_nodes.append((x, y))
+
+    # Sort by distance from origin
+    if axis == 'x':
+        axis_nodes.sort(key=lambda p: p[0])
+    else:
+        axis_nodes.sort(key=lambda p: p[1])
+
+    return axis_nodes
+
+
+def create_boundary_segments_symmetric(elements: List[Tri6Element], nodes: Dict[int, Tuple[float, float]], scale: float):
+    """Create boundary segments from combined mesh (gốc + mirrored).
+
+    Vì mesh đã được mirror, cả X-axis và Y-axis đều có corner nodes từ mesh.
+    Điều này đảm bảo segments trên 2 trục có độ dài khớp hoàn hảo.
+    """
+    # Extract nodes on both axes
+    x_axis_nodes = extract_boundary_nodes_on_axis(elements, nodes, 'x')
+    y_axis_nodes = extract_boundary_nodes_on_axis(elements, nodes, 'y')
+
+    if len(x_axis_nodes) < 2 or len(y_axis_nodes) < 2:
+        print("      WARNING: Not enough nodes on axes for boundary segments")
+        return []
+
+    # Verify symmetry: số nodes trên 2 trục phải bằng nhau
+    if len(x_axis_nodes) != len(y_axis_nodes):
+        print(f"      WARNING: Asymmetric mesh! X-axis: {len(x_axis_nodes)}, Y-axis: {len(y_axis_nodes)}")
+        # Dùng số nhỏ hơn
+        n_nodes = min(len(x_axis_nodes), len(y_axis_nodes))
+    else:
+        n_nodes = len(x_axis_nodes)
+        print(f"      Found {n_nodes} nodes on each axis -> {n_nodes - 1} segment pairs")
+
+    boundary_pairs = []
+    for i in range(n_nodes - 1):
+        # X-axis segment
+        x1_x, _ = x_axis_nodes[i]
+        x2_x, _ = x_axis_nodes[i + 1]
+
+        # Y-axis segment
+        _, y1_y = y_axis_nodes[i]
+        _, y2_y = y_axis_nodes[i + 1]
+
+        # Scale to mm
+        x1_mm = x1_x * scale
+        x2_mm = x2_x * scale
+        y1_mm = y1_y * scale
+        y2_mm = y2_y * scale
+
+        # Verify lengths match (should be identical due to mesh mirroring)
+        len_x = abs(x2_mm - x1_mm)
+        len_y = abs(y2_mm - y1_mm)
+        if abs(len_x - len_y) > 0.01:  # 0.01mm tolerance
+            print(f"        WARNING: Segment {i+1} length mismatch: X={len_x:.3f}, Y={len_y:.3f}")
+
+        boundary_pairs.append({
+            "name": f"boundary_side_{i+1}",
+            "x_axis": {
+                "x1": x1_mm, "y1": 0.0,
+                "x2": x2_mm, "y2": 0.0
+            },
+            "y_axis": {
+                "x1": 0.0, "y1": y1_mm,
+                "x2": 0.0, "y2": y2_mm
+            }
+        })
+
+    return boundary_pairs
+
+
 def save_centroids_json(out_path: str, air_centroids: List, iron_centroids: List,
                         boundary_pairs: List = None):
     """Save centroids and boundary info to JSON for FEMM."""
@@ -446,185 +577,278 @@ def save_centroids_json(out_path: str, air_centroids: List, iron_centroids: List
 
 
 # ============================================================================
-# Main
+# Main / API
 # ============================================================================
-def main(tra_path: str, output_dir: str = "."):
-    print("=" * 60)
-    print("Export AIR và IRON riêng biệt")
-    print("=" * 60)
-    
-    # Load
-    print("\n1. Loading mesh...")
+def generate_geometry(weights: np.ndarray, tra_path: str, output_dir: str = ".",
+                      verbose: bool = True) -> Tuple[str, str]:
+    """
+    Generate DXF và JSON từ weights của NGNet.
+
+    Args:
+        weights: numpy array chứa weights cho NGNet (kích thước = n_radial * n_angular)
+        tra_path: đường dẫn file TRA (mesh)
+        output_dir: thư mục output
+        verbose: in thông tin chi tiết
+
+    Returns:
+        Tuple[dxf_path, json_path]: đường dẫn file DXF và JSON đã tạo
+    """
+    if verbose:
+        print("=" * 60)
+        print("Generate geometry from weights")
+        print("=" * 60)
+
+    # Load mesh
+    if verbose:
+        print("\n1. Loading mesh...")
     nodes = parse_tra_nodes(tra_path)
     elements = parse_tra_elements(tra_path)
-    print(f"   {len(nodes)} nodes, {len(elements)} elements")
-    
+    if verbose:
+        print(f"   {len(nodes)} nodes, {len(elements)} elements")
+
     radii = [np.sqrt(x**2 + y**2) for x, y in nodes.values()]
     r_min, r_max = min(radii), max(radii)
-    
-    # NGnet
-    print("\n2. NGnet setup...")
+
+    # NGnet config
+    n_radial = 6
+    n_angular = 5
     config = NGnetConfig(
         r_min=r_min + (r_max - r_min) * 0.1,
         r_max=r_max - (r_max - r_min) * 0.1,
         theta_min=0,
         theta_max=np.pi / 4,
-        n_radial=6,
-        n_angular=5,
+        n_radial=n_radial,
+        n_angular=n_angular,
     )
     ngnet = NGnet(config)
-    ngnet.set_random_weights(seed=3)
-    
-    # Assign materials
-    print("\n3. Assigning materials...")
+
+    # Set weights từ input
+    if len(weights) != len(ngnet.weights):
+        raise ValueError(f"weights size mismatch: expected {len(ngnet.weights)}, got {len(weights)}")
+    ngnet.weights = np.array(weights)
+
+    # Assign materials và tạo geometry
+    return _build_geometry(elements, nodes, ngnet, output_dir, verbose)
+
+
+def get_ngnet_size(tra_path: str, n_radial: int = 6, n_angular: int = 5) -> int:
+    """Trả về số lượng weights cần cho NGNet."""
+    return n_radial * n_angular
+
+
+def _build_geometry(elements, nodes, ngnet, output_dir, verbose) -> Tuple[str, str]:
+    """Internal function để build geometry từ ngnet đã có weights.
+
+    Quy trình đúng: Mirror MESH trước, rồi mới tạo polygon.
+    Điều này đảm bảo đường biên X-axis và Y-axis hoàn toàn đối xứng.
+    """
+
+    # Assign materials cho mesh gốc (0-45°)
+    if verbose:
+        print("\n2. Assigning materials to original mesh (0-45°)...")
     assign_materials(elements, nodes, ngnet)
     n_iron = sum(1 for e in elements if e.material == Material.IRON)
     n_air = sum(1 for e in elements if e.material == Material.AIR)
-    print(f"   Iron: {n_iron}, Air: {n_air}")
-    
-    # Convert to polygons
-    print("\n4. Building polygons...")
+    if verbose:
+        print(f"   Original mesh - Iron: {n_iron}, Air: {n_air}")
+
+    # Mirror mesh (0-45° → 45-90°) - material được copy từ original
+    if verbose:
+        print("\n3. Mirroring mesh to create symmetric 0-90° mesh...")
+    mirrored_nodes, mirrored_elements = mirror_mesh(nodes, elements)
+    if verbose:
+        print(f"   Mirrored mesh: {len(mirrored_nodes)} nodes, {len(mirrored_elements)} elements")
+
+    # Combine original + mirrored mesh
+    combined_nodes = {**nodes, **mirrored_nodes}
+    combined_elements = elements + mirrored_elements
+    if verbose:
+        print(f"   Combined mesh: {len(combined_nodes)} nodes, {len(combined_elements)} elements")
+
+    # Convert to polygons (từ combined mesh 0-90°)
+    if verbose:
+        print("\n4. Building polygons from combined mesh...")
     iron_polys = []
     air_polys = []
     all_polys = []
-    
-    for e in elements:
-        p = element_to_polygon(e, nodes, DXF_SCALE)
+
+    for e in combined_elements:
+        p = element_to_polygon(e, combined_nodes, DXF_SCALE)
         if p and p.is_valid and not p.is_empty:
             all_polys.append(p)
             if e.material == Material.IRON:
                 iron_polys.append(p)
             else:
                 air_polys.append(p)
-    
-    # Merge
-    print("\n5. Merging...")
-    
+
+    # Merge polygons
+    if verbose:
+        print("\n5. Merging polygons...")
+
     # Total region (all elements)
-    print("   Merging total...")
-    total_union = unary_union(all_polys)
-    total_mirrored = mirror_polygon_45(total_union) if isinstance(total_union, Polygon) else unary_union([mirror_polygon_45(p) for p in polygon_to_list(total_union)])
-    total_final = unary_union([total_union, total_mirrored])
+    if verbose:
+        print("   Merging total...")
+    total_final = unary_union(all_polys)
     total_list = polygon_to_list(total_final)
-    print(f"   -> Total: {len(total_list)} region(s)")
-    
+    if verbose:
+        print(f"   -> Total: {len(total_list)} region(s)")
+
     # AIR regions - cluster by adjacency to keep separate regions
-    print("   Clustering AIR regions by adjacency...")
-    air_clusters = cluster_adjacent_elements(elements, Material.AIR)
-    print(f"   -> Found {len(air_clusters)} AIR cluster(s) in original mesh")
+    if verbose:
+        print("   Clustering AIR regions by adjacency...")
+    air_clusters = cluster_adjacent_elements(combined_elements, Material.AIR)
+    if verbose:
+        print(f"   -> Found {len(air_clusters)} AIR cluster(s)")
 
     air_list = []
     for cluster in air_clusters:
         # Merge triangles within this cluster
-        cluster_polys = [element_to_polygon(e, nodes, DXF_SCALE) for e in cluster]
+        cluster_polys = [element_to_polygon(e, combined_nodes, DXF_SCALE) for e in cluster]
         cluster_polys = [p for p in cluster_polys if p and p.is_valid and not p.is_empty]
         if cluster_polys:
             cluster_union = unary_union(cluster_polys)
-            # Mirror and add both
-            cluster_mirrored = mirror_polygon_45(cluster_union) if isinstance(cluster_union, Polygon) else unary_union([mirror_polygon_45(p) for p in polygon_to_list(cluster_union)])
             air_list.extend(polygon_to_list(cluster_union))
-            air_list.extend(polygon_to_list(cluster_mirrored))
 
-    # Compute air_final for IRON calculation
-    air_final = unary_union(air_list) if air_list else Polygon()
-    print(f"   -> AIR: {len(air_list)} region(s) after mirroring")
-    
-    # IRON = Total - AIR
-    print("   Computing IRON = Total - AIR...")
-    if air_final and not air_final.is_empty:
-        iron_final = total_final.difference(air_final)
-    else:
-        iron_final = total_final
-    iron_list = polygon_to_list(iron_final)
-    print(f"   -> IRON: {len(iron_list)} region(s)")
-    
-    # Simplify
-    simplify_tol = 0.1
-    air_list = [p.simplify(simplify_tol) for p in air_list]
-    iron_list = [p.simplify(simplify_tol) for p in iron_list]
-    
+    if verbose:
+        print(f"   -> AIR: {len(air_list)} region(s)")
+
+    # IRON regions - cluster by adjacency (giống AIR, KHÔNG dùng difference)
+    # Điều này đảm bảo IRON boundaries khớp chính xác với mesh nodes
+    if verbose:
+        print("   Clustering IRON regions by adjacency...")
+    iron_clusters = cluster_adjacent_elements(combined_elements, Material.IRON)
+    if verbose:
+        print(f"   -> Found {len(iron_clusters)} IRON cluster(s)")
+
+    iron_list = []
+    for cluster in iron_clusters:
+        cluster_polys = [element_to_polygon(e, combined_nodes, DXF_SCALE) for e in cluster]
+        cluster_polys = [p for p in cluster_polys if p and p.is_valid and not p.is_empty]
+        if cluster_polys:
+            cluster_union = unary_union(cluster_polys)
+            iron_list.extend(polygon_to_list(cluster_union))
+
+    if verbose:
+        print(f"   -> IRON: {len(iron_list)} region(s)")
+
+    # KHÔNG simplify - giữ nguyên vertices từ mesh để đảm bảo đối xứng hoàn hảo
+    # (Nếu cần simplify, phải làm theo cách đối xứng qua đường 45°)
+
     # Export combined DXF
-    print("\n6. Exporting DXF and centroids...")
+    if verbose:
+        print("\n6. Exporting DXF and centroids...")
     dxf_path = os.path.join(output_dir, "combined_regions.dxf")
     json_path = os.path.join(output_dir, "centroids.json")
 
     write_combined_dxf(dxf_path, {"AIR": air_list, "IRON": iron_list})
 
-    # Compute centroids using original element centroids (more reliable)
-    print("   Computing block label positions from original elements...")
-    air_elem_centroids = get_element_centroids(elements, nodes, DXF_SCALE, Material.AIR)
-    iron_elem_centroids = get_element_centroids(elements, nodes, DXF_SCALE, Material.IRON)
-
-    # Also include mirrored centroids (y=x mirror)
-    air_elem_centroids += [(y, x) for x, y in air_elem_centroids]
-    iron_elem_centroids += [(y, x) for x, y in iron_elem_centroids]
+    # Compute centroids using combined element centroids
+    if verbose:
+        print("   Computing block label positions from combined mesh elements...")
+    air_elem_centroids = get_element_centroids(combined_elements, combined_nodes, DXF_SCALE, Material.AIR)
+    iron_elem_centroids = get_element_centroids(combined_elements, combined_nodes, DXF_SCALE, Material.IRON)
 
     # Find one representative point per merged polygon
     air_centroids = find_representative_points(air_list, air_elem_centroids)
     iron_centroids = find_representative_points(iron_list, iron_elem_centroids)
 
-    # Create boundary segments for anti-periodic BC (from mesh CORNER nodes on axis)
-    print("   Creating boundary segments from mesh corner nodes...")
-    boundary_pairs = create_boundary_segments(elements, nodes, DXF_SCALE)
-    print(f"   -> Created {len(boundary_pairs)} boundary segment pair(s)")
+    # Create boundary segments from COMBINED mesh (đảm bảo symmetric)
+    if verbose:
+        print("   Creating boundary segments from combined mesh corner nodes...")
+    boundary_pairs = create_boundary_segments_symmetric(combined_elements, combined_nodes, DXF_SCALE)
+    if verbose:
+        print(f"   -> Created {len(boundary_pairs)} boundary segment pair(s)")
 
     save_centroids_json(json_path, air_centroids, iron_centroids, boundary_pairs)
-    
-    # Visualization
-    print("\n7. Creating preview...")
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Polygon as MplPoly
-        
-        fig, axes = plt.subplots(1, 2, figsize=(14, 7), dpi=150)
-        
-        # AIR
-        ax1 = axes[0]
-        ax1.set_aspect("equal")
-        ax1.set_title(f"AIR regions ({len(air_list)})")
-        for p in air_list:
-            if p.exterior:
-                ax1.fill(*zip(*p.exterior.coords), facecolor='lightyellow', 
-                        edgecolor='orange', linewidth=1.5)
-                for interior in p.interiors:
-                    ax1.fill(*zip(*interior.coords), facecolor='white', 
-                            edgecolor='orange', linewidth=1)
-        ax1.autoscale()
-        ax1.set_xlabel("x (mm)")
-        ax1.set_ylabel("y (mm)")
-        
-        # IRON
-        ax2 = axes[1]
-        ax2.set_aspect("equal")
-        ax2.set_title(f"IRON regions ({len(iron_list)})")
-        for p in iron_list:
-            if p.exterior:
-                ax2.fill(*zip(*p.exterior.coords), facecolor='steelblue', 
-                        edgecolor='darkblue', linewidth=1.5)
-                for interior in p.interiors:
-                    ax2.fill(*zip(*interior.coords), facecolor='white', 
-                            edgecolor='darkblue', linewidth=1)
-        ax2.autoscale()
-        ax2.set_xlabel("x (mm)")
-        ax2.set_ylabel("y (mm)")
-        
-        plt.tight_layout()
-        png_path = os.path.join(output_dir, "air_iron_preview.png")
-        fig.savefig(png_path)
-        plt.close()
-        print(f"  Wrote: {png_path}")
-    except Exception as e:
-        print(f"  Preview failed: {e}")
-    
-    print("\n" + "=" * 60)
-    print("DONE!")
-    print(f"\nFiles đã tạo:")
-    print(f"  1. {dxf_path}  <- DXF với 2 layer: AIR, IRON")
-    print(f"  2. {json_path} <- Tọa độ centroid để đặt block labels")
-    print("\nBước tiếp theo: Chạy plot_fem.py để import vào FEMM")
+
+    # Visualization (only when verbose)
+    if verbose:
+        print("\n7. Creating preview...")
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig, axes = plt.subplots(1, 2, figsize=(14, 7), dpi=150)
+
+            # AIR
+            ax1 = axes[0]
+            ax1.set_aspect("equal")
+            ax1.set_title(f"AIR regions ({len(air_list)})")
+            for p in air_list:
+                if p.exterior:
+                    ax1.fill(*zip(*p.exterior.coords), facecolor='lightyellow',
+                            edgecolor='orange', linewidth=1.5)
+                    for interior in p.interiors:
+                        ax1.fill(*zip(*interior.coords), facecolor='white',
+                                edgecolor='orange', linewidth=1)
+            ax1.autoscale()
+            ax1.set_xlabel("x (mm)")
+            ax1.set_ylabel("y (mm)")
+
+            # IRON
+            ax2 = axes[1]
+            ax2.set_aspect("equal")
+            ax2.set_title(f"IRON regions ({len(iron_list)})")
+            for p in iron_list:
+                if p.exterior:
+                    ax2.fill(*zip(*p.exterior.coords), facecolor='steelblue',
+                            edgecolor='darkblue', linewidth=1.5)
+                    for interior in p.interiors:
+                        ax2.fill(*zip(*interior.coords), facecolor='white',
+                                edgecolor='darkblue', linewidth=1)
+            ax2.autoscale()
+            ax2.set_xlabel("x (mm)")
+            ax2.set_ylabel("y (mm)")
+
+            plt.tight_layout()
+            png_path = os.path.join(output_dir, "air_iron_preview.png")
+            fig.savefig(png_path)
+            plt.close()
+            print(f"  Wrote: {png_path}")
+        except Exception as e:
+            print(f"  Preview failed: {e}")
+
+        print("\n" + "=" * 60)
+        print("DONE!")
+        print(f"\nFiles đã tạo:")
+        print(f"  1. {dxf_path}  <- DXF với 2 layer: AIR, IRON")
+        print(f"  2. {json_path} <- Tọa độ centroid để đặt block labels")
+        print("=" * 60)
+
+    return dxf_path, json_path
+
+
+def main(tra_path: str, output_dir: str = "."):
+    """Main function để chạy standalone với random weights."""
     print("=" * 60)
+    print("Export AIR và IRON riêng biệt (standalone mode)")
+    print("=" * 60)
+
+    # Load mesh để lấy config
+    nodes = parse_tra_nodes(tra_path)
+    elements = parse_tra_elements(tra_path)
+
+    radii = [np.sqrt(x**2 + y**2) for x, y in nodes.values()]
+    r_min, r_max = min(radii), max(radii)
+
+    # NGnet config
+    n_radial = 6
+    n_angular = 5
+    config = NGnetConfig(
+        r_min=r_min + (r_max - r_min) * 0.1,
+        r_max=r_max - (r_max - r_min) * 0.1,
+        theta_min=0,
+        theta_max=np.pi / 4,
+        n_radial=n_radial,
+        n_angular=n_angular,
+    )
+    ngnet = NGnet(config)
+    ngnet.set_random_weights(seed=3)
+
+    # Build geometry
+    _build_geometry(elements, nodes, ngnet, output_dir, verbose=True)
+    print("\nBước tiếp theo: Chạy plot_fem.py để import vào FEMM")
 
 
 if __name__ == "__main__":

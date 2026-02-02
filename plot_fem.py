@@ -2,8 +2,12 @@
 import json
 import math
 from pathlib import Path
+from typing import List, Tuple
 
 import femm
+
+# Global flag để track FEMM đã mở chưa
+_femm_opened = False
 
 
 def calculate_phase_currents(Im=11, ini=-15, adv=35):
@@ -18,6 +22,235 @@ def calculate_phase_currents(Im=11, ini=-15, adv=35):
     return i_a, i_b, i_c
 
 
+def ensure_femm_open():
+    """Mở FEMM nếu chưa mở."""
+    global _femm_opened
+    if not _femm_opened:
+        femm.openfemm(1)  # 1 = minimized
+        _femm_opened = True
+
+
+def close_femm():
+    """Đóng FEMM."""
+    global _femm_opened
+    if _femm_opened:
+        femm.closefemm()
+        _femm_opened = False
+
+
+def setup_model(
+    base_fem: str,
+    rotor_dxf: str,
+    centroids_json: str,
+    output_fem: str = None,
+    verbose: bool = True,
+) -> Tuple[str, dict]:
+    """
+    Setup model: import DXF, đặt block labels, tạo boundaries.
+    KHÔNG chạy analyze - chỉ setup geometry.
+
+    Returns:
+        Tuple[output_fem_path, centroids_data]
+    """
+    base_path = Path(base_fem).absolute()
+    dxf_path = Path(rotor_dxf).absolute()
+    json_path = Path(centroids_json).absolute()
+
+    if output_fem is None:
+        output_fem = base_path.parent / (base_path.stem + "_with_rotor.FEM")
+    else:
+        output_fem = Path(output_fem).absolute()
+
+    # Load centroids
+    if verbose:
+        print("Loading centroids...")
+    with open(json_path, "r") as f:
+        centroids_data = json.load(f)
+
+    air_points = centroids_data.get("air", [])
+    iron_points = centroids_data.get("iron", [])
+    boundary_pairs = centroids_data.get("boundaries", [])
+    if verbose:
+        print(f"  AIR: {len(air_points)} points, IRON: {len(iron_points)} points")
+        print(f"  Boundaries: {len(boundary_pairs)} pairs")
+
+    # Mở FEMM
+    ensure_femm_open()
+
+    # Đóng document cũ nếu còn mở (tránh chồng lấn)
+    try:
+        femm.mi_close()
+    except:
+        pass
+
+    # Mở file gốc
+    femm.opendocument(base_path.as_posix())
+
+    # Import DXF
+    if verbose:
+        print(f"Importing DXF: {dxf_path}")
+    femm.mi_readdxf(dxf_path.as_posix())
+
+    # Đặt block labels cho AIR - gán vào group 2 để tính torque
+    if verbose:
+        print("Placing AIR block labels (group 2)...")
+    for pt in air_points:
+        x, y = pt["x"], pt["y"]
+        femm.mi_addblocklabel(x, y)
+        femm.mi_selectlabel(x, y)
+        femm.mi_setblockprop("Air", 0, 4, "<None>", 0, 2, 0)
+        femm.mi_clearselected()
+
+    # Đặt block labels cho IRON
+    if verbose:
+        print("Placing IRON block labels (M350_50A, group 2)...")
+    for pt in iron_points:
+        x, y = pt["x"], pt["y"]
+        femm.mi_addblocklabel(x, y)
+        femm.mi_selectlabel(x, y)
+        femm.mi_setblockprop("M350_50A", 0, 4, "<None>", 0, 2, 0)
+        femm.mi_clearselected()
+
+    # Tạo Anti-periodic boundary conditions
+    if boundary_pairs and verbose:
+        print(f"Creating anti-periodic boundaries ({len(boundary_pairs)} pairs)...")
+    for pair in boundary_pairs:
+        name = pair["name"]
+        femm.mi_addboundprop(name, 0, 0, 0, 0, 0, 0, 0, 0, 5)
+
+        edge_x = pair["x_axis"]
+        mid_x = (edge_x["x1"] + edge_x["x2"]) / 2
+        mid_y = (edge_x["y1"] + edge_x["y2"]) / 2
+        try:
+            femm.mi_selectsegment(mid_x, mid_y)
+            femm.mi_setsegmentprop(name, 0, 1, 0, 1)
+            femm.mi_clearselected()
+        except:
+            pass
+
+        edge_y = pair["y_axis"]
+        mid_x = (edge_y["x1"] + edge_y["x2"]) / 2
+        mid_y = (edge_y["y1"] + edge_y["y2"]) / 2
+        try:
+            femm.mi_selectsegment(mid_x, mid_y)
+            femm.mi_setsegmentprop(name, 0, 1, 0, 1)
+            femm.mi_clearselected()
+        except:
+            pass
+
+    # Lưu file mới
+    femm.mi_saveas(str(output_fem))
+
+    if verbose:
+        print(f"Model saved: {output_fem}")
+
+    # Đóng document để tránh chồng lấn khi gọi lại
+    femm.mi_close()
+
+    return str(output_fem), centroids_data
+
+
+def evaluate_torque(
+    fem_file: str,
+    adv: float,
+    Im: float = 11,
+    ini: float = -15,
+    verbose: bool = True,
+) -> float:
+    """
+    Chạy simulation với góc adv cho trước và trả về torque.
+
+    Args:
+        fem_file: File FEM đã setup (có geometry)
+        adv: Góc advance (độ)
+        Im: Biên độ dòng điện (A)
+        ini: Góc ban đầu (độ)
+        verbose: In thông tin
+
+    Returns:
+        Torque (N.m)
+    """
+    ensure_femm_open()
+
+    # Đóng document cũ nếu còn mở (tránh chồng lấn khi có error trước đó)
+    try:
+        femm.mi_close()
+    except:
+        pass
+
+    # Mở file
+    femm.opendocument(str(Path(fem_file).absolute()))
+
+    # Tính dòng điện 3 pha
+    i_a, i_b, i_c = calculate_phase_currents(Im, ini, adv)
+
+    if verbose:
+        print(f"  adv={adv}°: i_a={i_a:.3f}, i_b={i_b:.3f}, i_c={i_c:.3f}", end="")
+
+    # Gán dòng điện
+    femm.mi_modifycircprop("PhaseA", 1, i_a)
+    femm.mi_modifycircprop("PhaseB", 1, i_b)
+    femm.mi_modifycircprop("PhaseC", 1, i_c)
+
+    # Analyze
+    femm.mi_analyze(1)  # 1 = minimize window
+    femm.mi_loadsolution()
+
+    # Tính torque
+    femm.mo_groupselectblock(2)
+    torque = femm.mo_blockintegral(22)
+    femm.mo_clearblock()
+
+    if verbose:
+        print(f" -> torque={torque:.4f} N.m")
+
+    # Đóng solution và document
+    femm.mo_close()
+    femm.mi_close()
+
+    return torque
+
+
+def sweep_adv_for_max_torque(
+    fem_file: str,
+    adv_list: List[float] = None,
+    Im: float = 11,
+    ini: float = -15,
+    verbose: bool = True,
+) -> Tuple[float, float, List[Tuple[float, float]]]:
+    """
+    Quét nhiều góc adv và tìm torque max.
+
+    Args:
+        fem_file: File FEM đã setup
+        adv_list: Danh sách góc adv (mặc định [35, 40, 45, 50, 55])
+        Im: Biên độ dòng điện
+        ini: Góc ban đầu
+        verbose: In thông tin
+
+    Returns:
+        Tuple[best_adv, max_torque, all_results]: góc tốt nhất, torque max, và tất cả kết quả
+    """
+    if adv_list is None:
+        adv_list = [35, 40, 45, 50, 55]
+
+    if verbose:
+        print(f"\nSweeping adv = {adv_list}...")
+
+    results = []
+    for adv in adv_list:
+        torque = evaluate_torque(fem_file, adv, Im, ini, verbose=verbose)
+        results.append((adv, torque))
+
+    # Tìm max
+    best_adv, max_torque = max(results, key=lambda x: x[1])
+
+    if verbose:
+        print(f"\nBest: adv={best_adv}° -> torque={max_torque:.4f} N.m")
+
+    return best_adv, max_torque, results
+
+
 def create_model_with_rotor(
     base_fem="basic.FEM",
     rotor_dxf="combined_regions.dxf",
@@ -26,7 +259,7 @@ def create_model_with_rotor(
 ):
     """
     Mở file FEM gốc, import rotor từ DXF, đặt block labels tự động.
-    File gốc không bị thay đổi.
+    File gốc không bị thay đổi. (Legacy function - giữ để tương thích)
 
     Args:
         base_fem: File FEM gốc
@@ -63,7 +296,7 @@ def create_model_with_rotor(
 
     # Tính và set dòng điện 3 pha theo phương trình
     Im = 11      # Biên độ dòng điện (A)
-    ini = -15    # Góc ban đầu (độ)                                                          #change here
+    ini = -15    # Góc ban đầu (độ)
     adv = 35     # Control angle (độ)
 
     i_a, i_b, i_c = calculate_phase_currents(Im, ini, adv)
