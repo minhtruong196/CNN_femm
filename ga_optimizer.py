@@ -403,7 +403,12 @@ def main():
     # Paths
     tra_path = "rotor_2.TRA"
     base_fem = "basic.FEM"
-    output_dir = "."
+    output_dir = "ga_output"  # Thư mục chứa tất cả file output
+
+    # Tạo thư mục output nếu chưa có
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"Created output directory: {output_dir}/")
 
     # Check files exist
     if not os.path.exists(tra_path):
@@ -428,8 +433,8 @@ def main():
 
     # GA config
     config = GAConfig(
-        population_size=20,                                     # Nhỏ để test nhanh, tăng lên 20-50 cho production
-        generations=50,                                          # Nhỏ để test, tăng lên 50-100 cho production
+        population_size=2,                                     # Nhỏ để test nhanh, tăng lên 20-50 cho production
+        generations=1,                                          # Nhỏ để test, tăng lên 50-100 cho production
         crossover_rate=0.8,
         mutation_rate=0.15,
         mutation_sigma=0.2,
