@@ -17,13 +17,14 @@ import sys
 import json
 import time
 import numpy as np
+import multiprocessing as mp
 from dataclasses import dataclass, field
 from typing import List, Tuple, Callable
 from pathlib import Path
 
 # Import modules từ project
 from dxf_part import generate_geometry, get_ngnet_size
-from plot_fem import setup_model, sweep_adv_for_max_torque, close_femm
+from plot_fem import setup_model, sweep_adv_for_max_torque, close_femm, evaluate_individual_worker
 
 
 @dataclass
@@ -47,6 +48,9 @@ class GAConfig:
     # Motor parameters
     Im: float = 11.0   # Biên độ dòng điện (A)
     ini: float = -15.0  # Góc ban đầu (độ)
+
+    # Parallel processing
+    max_parallel: int = 1  # Số mô phỏng FEMM chạy đồng thời (1 = tuần tự)
 
 
 @dataclass
@@ -148,6 +152,80 @@ class GAOptimizer:
             individual.fitness = 0.0
             return 0.0
 
+    def evaluate_population_parallel(self, population: List[Individual], verbose: bool = True):
+        """
+        Đánh giá fitness của tất cả individuals chưa được evaluate.
+        Chạy song song theo batch với max_parallel workers.
+        """
+        # Lọc ra các individuals cần evaluate
+        to_evaluate = [(i, ind) for i, ind in enumerate(population) if ind.fitness == 0.0]
+
+        if not to_evaluate:
+            return
+
+        max_parallel = self.config.max_parallel
+
+        if max_parallel <= 1:
+            # Chạy tuần tự (như cũ)
+            for i, ind in to_evaluate:
+                if verbose:
+                    print(f"  Individual {i + 1}/{len(population)}", end=" ")
+                self.evaluate_fitness(ind, verbose=False)
+                if verbose:
+                    print(f"-> fitness={ind.fitness:.4f} N.m")
+            return
+
+        # Chạy song song
+        if verbose:
+            print(f"  Evaluating {len(to_evaluate)} individuals in parallel (max {max_parallel} workers)...")
+
+        # Chia thành các batch
+        batches = []
+        for start in range(0, len(to_evaluate), max_parallel):
+            batch = to_evaluate[start:start + max_parallel]
+            batches.append(batch)
+
+        for batch_idx, batch in enumerate(batches):
+            if verbose:
+                print(f"  Batch {batch_idx + 1}/{len(batches)} ({len(batch)} individuals)...", end=" ", flush=True)
+
+            # Chuẩn bị arguments cho workers
+            worker_args = []
+            for local_id, (_, ind) in enumerate(batch):
+                worker_id = batch_idx * max_parallel + local_id
+                args = (
+                    worker_id,
+                    ind.weights,
+                    self.tra_path,
+                    self.base_fem,
+                    self.output_dir,
+                    self.config.adv_list,
+                    self.config.Im,
+                    self.config.ini
+                )
+                worker_args.append(args)
+
+            # Chạy song song với Pool
+            try:
+                with mp.Pool(processes=len(batch)) as pool:
+                    results = pool.map(evaluate_individual_worker, worker_args)
+
+                # Cập nhật fitness
+                for (_, ind), (_, fitness, best_adv) in zip(batch, results):
+                    ind.fitness = fitness
+                    ind.best_adv = best_adv
+                    self.eval_count += 1
+
+                if verbose:
+                    fitnesses = [ind.fitness for _, ind in batch]
+                    print(f"done! (avg={np.mean(fitnesses):.4f}, max={max(fitnesses):.4f} N.m)")
+
+            except Exception as e:
+                print(f"\n  ERROR in parallel evaluation: {e}")
+                print("  Falling back to sequential evaluation...")
+                for _, ind in batch:
+                    self.evaluate_fitness(ind, verbose=False)
+
     def tournament_selection(self, population: List[Individual]) -> Individual:
         """Chọn individual bằng tournament selection."""
         tournament = np.random.choice(
@@ -213,6 +291,10 @@ class GAOptimizer:
         print(f"Mutation rate: {self.config.mutation_rate}")
         print(f"Elitism: {self.config.elitism}")
         print(f"Adv sweep: {self.config.adv_list}")
+        if self.config.max_parallel > 1:
+            print(f"Parallel workers: {self.config.max_parallel} (chạy {self.config.max_parallel} FEMM cùng lúc)")
+        else:
+            print("Parallel workers: 1 (chạy tuần tự)")
         print("=" * 60)
 
         # Initialize
@@ -224,12 +306,8 @@ class GAOptimizer:
             gen_start = time.time()
             print(f"\n--- Generation {gen + 1}/{self.config.generations} ---")
 
-            # Evaluate fitness cho tất cả individuals
-            for i, ind in enumerate(population):
-                if ind.fitness == 0.0:  # Chưa evaluate
-                    print(f"  Individual {i + 1}/{len(population)}", end=" ")
-                    self.evaluate_fitness(ind, verbose=False)
-                    print(f"-> fitness={ind.fitness:.4f} N.m")
+            # Evaluate fitness cho tất cả individuals (song song nếu max_parallel > 1)
+            self.evaluate_population_parallel(population, verbose=True)
 
             # Sort by fitness (descending)
             population.sort(key=lambda x: x.fitness, reverse=True)
@@ -321,9 +399,9 @@ class GAOptimizer:
 
 
 def main():
-    """Main function để chạy GA optimization."""                
-    # Paths                                                     #file paths
-    tra_path = "rotor_2.TRA"        
+    """Main function để chạy GA optimization."""
+    # Paths
+    tra_path = "rotor_2.TRA"
     base_fem = "basic.FEM"
     output_dir = "."
 
@@ -335,18 +413,32 @@ def main():
         print(f"ERROR: FEM file not found: {base_fem}")
         sys.exit(1)
 
+    # Hỏi số workers
+    print("=" * 60)
+    print("GA + NGNet + FEMM Topology Optimization")
+    print("=" * 60)
+    try:
+        max_parallel = int(input("Số mô phỏng FEMM chạy đồng thời (1 = tuần tự, khuyến nghị 2-8): ") or "1")
+        if max_parallel < 1:
+            max_parallel = 1
+        print(f"-> Sẽ chạy {max_parallel} FEMM instances cùng lúc")
+    except ValueError:
+        max_parallel = 1
+        print("-> Nhập không hợp lệ, chạy tuần tự (1 worker)")
+
     # GA config
     config = GAConfig(
-        population_size=10,                                     # Nhỏ để test nhanh, tăng lên 20-50 cho production
-        generations=5,                                          # Nhỏ để test, tăng lên 50-100 cho production
+        population_size=20,                                     # Nhỏ để test nhanh, tăng lên 20-50 cho production
+        generations=50,                                          # Nhỏ để test, tăng lên 50-100 cho production
         crossover_rate=0.8,
         mutation_rate=0.15,
         mutation_sigma=0.2,
         tournament_size=3,
         elitism=2,
-        adv_list=[35, 40, 45, 50, 55],                          #current sweeping angles
+        adv_list=[35, 40, 45, 50, 55],                          # current sweeping angles
         Im=11.0,
         ini=-15.0,
+        max_parallel=max_parallel,                              # Số FEMM chạy song song
     )
 
     # Create optimizer

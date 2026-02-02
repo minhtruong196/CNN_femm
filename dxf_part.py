@@ -580,7 +580,7 @@ def save_centroids_json(out_path: str, air_centroids: List, iron_centroids: List
 # Main / API
 # ============================================================================
 def generate_geometry(weights: np.ndarray, tra_path: str, output_dir: str = ".",
-                      verbose: bool = True) -> Tuple[str, str]:
+                      verbose: bool = True, output_prefix: str = None) -> Tuple[str, str]:
     """
     Generate DXF và JSON từ weights của NGNet.
 
@@ -589,6 +589,8 @@ def generate_geometry(weights: np.ndarray, tra_path: str, output_dir: str = ".",
         tra_path: đường dẫn file TRA (mesh)
         output_dir: thư mục output
         verbose: in thông tin chi tiết
+        output_prefix: prefix cho tên file output (để chạy song song)
+                       Nếu None, dùng "combined_regions" mặc định
 
     Returns:
         Tuple[dxf_path, json_path]: đường dẫn file DXF và JSON đã tạo
@@ -609,12 +611,12 @@ def generate_geometry(weights: np.ndarray, tra_path: str, output_dir: str = ".",
     radii = [np.sqrt(x**2 + y**2) for x, y in nodes.values()]
     r_min, r_max = min(radii), max(radii)
 
-    # NGnet config
+    # NGnet config                                                                          #gaucess center
     n_radial = 6
     n_angular = 5
     config = NGnetConfig(
-        r_min=r_min + (r_max - r_min) * 0.1,
-        r_max=r_max - (r_max - r_min) * 0.1,
+        r_min=r_min + (r_max - r_min) * 0,                                                #mechanical constraint
+        r_max=r_max - (r_max - r_min) * 0,
         theta_min=0,
         theta_max=np.pi / 4,
         n_radial=n_radial,
@@ -628,7 +630,7 @@ def generate_geometry(weights: np.ndarray, tra_path: str, output_dir: str = ".",
     ngnet.weights = np.array(weights)
 
     # Assign materials và tạo geometry
-    return _build_geometry(elements, nodes, ngnet, output_dir, verbose)
+    return _build_geometry(elements, nodes, ngnet, output_dir, verbose, output_prefix)
 
 
 def get_ngnet_size(tra_path: str, n_radial: int = 6, n_angular: int = 5) -> int:
@@ -636,12 +638,17 @@ def get_ngnet_size(tra_path: str, n_radial: int = 6, n_angular: int = 5) -> int:
     return n_radial * n_angular
 
 
-def _build_geometry(elements, nodes, ngnet, output_dir, verbose) -> Tuple[str, str]:
+def _build_geometry(elements, nodes, ngnet, output_dir, verbose, output_prefix=None) -> Tuple[str, str]:
     """Internal function để build geometry từ ngnet đã có weights.
 
     Quy trình đúng: Mirror MESH trước, rồi mới tạo polygon.
     Điều này đảm bảo đường biên X-axis và Y-axis hoàn toàn đối xứng.
+
+    Args:
+        output_prefix: prefix cho tên file (để chạy song song). Mặc định "combined_regions"
     """
+    if output_prefix is None:
+        output_prefix = "combined_regions"
 
     # Assign materials cho mesh gốc (0-45°)
     if verbose:
@@ -737,8 +744,8 @@ def _build_geometry(elements, nodes, ngnet, output_dir, verbose) -> Tuple[str, s
     # Export combined DXF
     if verbose:
         print("\n6. Exporting DXF and centroids...")
-    dxf_path = os.path.join(output_dir, "combined_regions.dxf")
-    json_path = os.path.join(output_dir, "centroids.json")
+    dxf_path = os.path.join(output_dir, f"{output_prefix}.dxf")
+    json_path = os.path.join(output_dir, f"{output_prefix}.json")
 
     write_combined_dxf(dxf_path, {"AIR": air_list, "IRON": iron_list})
 
@@ -802,7 +809,7 @@ def _build_geometry(elements, nodes, ngnet, output_dir, verbose) -> Tuple[str, s
             ax2.set_ylabel("y (mm)")
 
             plt.tight_layout()
-            png_path = os.path.join(output_dir, "air_iron_preview.png")
+            png_path = os.path.join(output_dir, f"{output_prefix}_preview.png")
             fig.savefig(png_path)
             plt.close()
             print(f"  Wrote: {png_path}")

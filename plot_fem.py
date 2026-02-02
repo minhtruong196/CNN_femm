@@ -6,8 +6,14 @@ from typing import List, Tuple
 
 import femm
 
-# Global flag để track FEMM đã mở chưa
+# Global flag để track FEMM đã mở chưa (mỗi process có flag riêng khi dùng multiprocessing)
 _femm_opened = False
+
+
+def reset_femm_state():
+    """Reset FEMM state cho worker mới (dùng trong multiprocessing)."""
+    global _femm_opened
+    _femm_opened = False
 
 
 def calculate_phase_currents(Im=11, ini=-15, adv=35):
@@ -406,6 +412,71 @@ def create_model_with_rotor(
     femm.mo_clearblock()
 
     return output_fem, torque
+
+
+def evaluate_individual_worker(args):
+    """
+    Worker function để đánh giá một individual trong subprocess riêng.
+    Dùng cho multiprocessing - mỗi worker có FEMM instance riêng.
+
+    Args:
+        args: tuple (worker_id, weights, tra_path, base_fem, output_dir, adv_list, Im, ini)
+
+    Returns:
+        tuple (worker_id, fitness, best_adv) hoặc (worker_id, 0.0, 0.0) nếu lỗi
+    """
+    worker_id, weights, tra_path, base_fem, output_dir, adv_list, Im, ini = args
+
+    # Import ở đây để tránh circular import
+    from dxf_part import generate_geometry
+
+    try:
+        # Reset FEMM state cho worker mới
+        reset_femm_state()
+
+        # Tạo tên file riêng cho worker này
+        output_prefix = f"worker_{worker_id}"
+
+        # 1. Tạo geometry từ weights
+        dxf_path, json_path = generate_geometry(
+            weights=weights,
+            tra_path=tra_path,
+            output_dir=output_dir,
+            verbose=False,
+            output_prefix=output_prefix
+        )
+
+        # 2. Setup FEMM model với output file riêng
+        output_fem = str(Path(output_dir) / f"{output_prefix}.FEM")
+        fem_file, _ = setup_model(
+            base_fem=base_fem,
+            rotor_dxf=dxf_path,
+            centroids_json=json_path,
+            output_fem=output_fem,
+            verbose=False
+        )
+
+        # 3. Quét adv để tìm max torque
+        best_adv, max_torque, _ = sweep_adv_for_max_torque(
+            fem_file=fem_file,
+            adv_list=adv_list,
+            Im=Im,
+            ini=ini,
+            verbose=False
+        )
+
+        # Đóng FEMM sau khi xong
+        close_femm()
+
+        return (worker_id, max_torque, best_adv)
+
+    except Exception as e:
+        print(f"Worker {worker_id} ERROR: {e}")
+        try:
+            close_femm()
+        except:
+            pass
+        return (worker_id, 0.0, 0.0)
 
 
 if __name__ == "__main__":
