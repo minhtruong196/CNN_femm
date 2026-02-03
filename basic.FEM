@@ -1,7 +1,7 @@
 [Format]      =  4.0
 [Frequency]   =  0
 [Precision]   =  1e-008
-[MinAngle]    =  30
+[MinAngle]    =  20
 [DoSmartMesh] =  1
 [Depth]       =  90
 [LengthUnits] =  millimeters
