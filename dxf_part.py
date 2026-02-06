@@ -231,6 +231,54 @@ def mirror_polygon_45(poly):
         return Polygon()
 
 
+def rotate_point(x, y, angle_deg):
+    """Rotate point (x, y) around origin by angle_deg degrees."""
+    angle_rad = np.radians(angle_deg)
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
+    x_new = x * cos_a - y * sin_a
+    y_new = x * sin_a + y * cos_a
+    return x_new, y_new
+
+
+def rotate_mesh(nodes: Dict[int, Tuple[float, float]], elements: List[Tri6Element],
+                angle_deg: float, node_offset: int, elem_offset: int):
+    """Rotate mesh around origin by angle_deg degrees.
+
+    Args:
+        nodes: Original nodes dict
+        elements: Original elements list
+        angle_deg: Rotation angle in degrees
+        node_offset: Offset to add to node IDs
+        elem_offset: Offset to add to element IDs
+
+    Returns:
+        Tuple[rotated_nodes, rotated_elements]
+    """
+    rotated_nodes = {}
+    for nid, (x, y) in nodes.items():
+        new_nid = nid + node_offset
+        x_new, y_new = rotate_point(x, y, angle_deg)
+        rotated_nodes[new_nid] = (x_new, y_new)
+
+    rotated_elements = []
+    for e in elements:
+        new_elem = Tri6Element(
+            eid=e.eid + elem_offset,
+            region=e.region,
+            n1=e.n1 + node_offset,
+            n2=e.n2 + node_offset,
+            n3=e.n3 + node_offset,
+            n4=e.n4 + node_offset,
+            n5=e.n5 + node_offset,
+            n6=e.n6 + node_offset,
+            material=e.material,
+        )
+        rotated_elements.append(new_elem)
+
+    return rotated_nodes, rotated_elements
+
+
 def polygon_to_list(geom):
     """Convert Polygon/MultiPolygon to list of Polygons"""
     if isinstance(geom, Polygon):
@@ -401,179 +449,17 @@ def find_representative_points(merged_polygons: List[Polygon],
     return points
 
 
-def extract_boundary_corner_nodes(elements: List[Tri6Element], nodes: Dict[int, Tuple[float, float]],
-                                   tol: float = 1e-9):
-    """Extract CORNER nodes that lie on X-axis (y≈0).
-
-    Only uses corner nodes (n1, n2, n3) from Tri6 elements, ignoring mid-edge nodes.
-    Returns sorted list of (x, y) tuples, sorted by x coordinate.
-    """
-    # Collect all corner node IDs
-    corner_node_ids = set()
-    for e in elements:
-        corner_node_ids.update(e.corner_nodes)  # n1, n2, n3 only
-
-    # Find corner nodes on X-axis
-    axis_nodes = []
-    for nid in corner_node_ids:
-        x, y = nodes[nid]
-        if abs(y) < tol and x > tol:  # On X-axis, x > 0
-            axis_nodes.append((x, y))
-
-    # Sort by x (which is the radial distance on X-axis)
-    axis_nodes.sort(key=lambda p: p[0])
-    return axis_nodes
-
-
-def create_boundary_segments(elements: List[Tri6Element], nodes: Dict[int, Tuple[float, float]], scale: float):
-    """Create boundary segments from mesh CORNER nodes on X-axis.
-
-    Mesh gốc từ 0-45°, các corner nodes trên trục X (y=0) sẽ là biên.
-    Mirror qua y=x: các nodes (x, 0) -> (0, x) trên trục Y.
-
-    Mỗi segment trên X-axis sẽ khớp với segment tương ứng trên Y-axis.
-    """
-    # Extract CORNER nodes on X-axis from original mesh (ignore mid-edge nodes)
-    axis_nodes = extract_boundary_corner_nodes(elements, nodes)
-
-    if len(axis_nodes) < 2:
-        print("      WARNING: Not enough nodes on X-axis for boundary segments")
-        return []
-
-    n_segments = len(axis_nodes) - 1
-    print(f"      Found {len(axis_nodes)} nodes on X-axis -> {n_segments} segments")
-
-    boundary_pairs = []
-    for i in range(n_segments):
-        x1, _ = axis_nodes[i]
-        x2, _ = axis_nodes[i + 1]
-
-        # Scale to mm
-        x1_mm = x1 * scale
-        x2_mm = x2 * scale
-
-        boundary_pairs.append({
-            "name": f"boundary_side_{i+1}",
-            "x_axis": {
-                "x1": x1_mm, "y1": 0.0,
-                "x2": x2_mm, "y2": 0.0
-            },
-            "y_axis": {
-                "x1": 0.0, "y1": x1_mm,  # Mirror: (x, 0) -> (0, x)
-                "x2": 0.0, "y2": x2_mm
-            }
-        })
-        print(f"        Segment {i+1}: r = {x1_mm:.2f} → {x2_mm:.2f} mm")
-
-    return boundary_pairs
-
-
-def extract_boundary_nodes_on_axis(elements: List[Tri6Element], nodes: Dict[int, Tuple[float, float]],
-                                    axis: str, tol: float = 1e-9) -> List[Tuple[float, float]]:
-    """Extract CORNER nodes on specified axis.
-
-    Args:
-        axis: 'x' for X-axis (y≈0), 'y' for Y-axis (x≈0)
-
-    Returns sorted list of (x, y) tuples.
-    """
-    corner_node_ids = set()
-    for e in elements:
-        corner_node_ids.update(e.corner_nodes)
-
-    axis_nodes = []
-    for nid in corner_node_ids:
-        x, y = nodes[nid]
-        if axis == 'x':
-            if abs(y) < tol and x > tol:  # On X-axis, x > 0
-                axis_nodes.append((x, y))
-        elif axis == 'y':
-            if abs(x) < tol and y > tol:  # On Y-axis, y > 0
-                axis_nodes.append((x, y))
-
-    # Sort by distance from origin
-    if axis == 'x':
-        axis_nodes.sort(key=lambda p: p[0])
-    else:
-        axis_nodes.sort(key=lambda p: p[1])
-
-    return axis_nodes
-
-
-def create_boundary_segments_symmetric(elements: List[Tri6Element], nodes: Dict[int, Tuple[float, float]], scale: float):
-    """Create boundary segments from combined mesh (gốc + mirrored).
-
-    Vì mesh đã được mirror, cả X-axis và Y-axis đều có corner nodes từ mesh.
-    Điều này đảm bảo segments trên 2 trục có độ dài khớp hoàn hảo.
-    """
-    # Extract nodes on both axes
-    x_axis_nodes = extract_boundary_nodes_on_axis(elements, nodes, 'x')
-    y_axis_nodes = extract_boundary_nodes_on_axis(elements, nodes, 'y')
-
-    if len(x_axis_nodes) < 2 or len(y_axis_nodes) < 2:
-        print("      WARNING: Not enough nodes on axes for boundary segments")
-        return []
-
-    # Verify symmetry: số nodes trên 2 trục phải bằng nhau
-    if len(x_axis_nodes) != len(y_axis_nodes):
-        print(f"      WARNING: Asymmetric mesh! X-axis: {len(x_axis_nodes)}, Y-axis: {len(y_axis_nodes)}")
-        # Dùng số nhỏ hơn
-        n_nodes = min(len(x_axis_nodes), len(y_axis_nodes))
-    else:
-        n_nodes = len(x_axis_nodes)
-        print(f"      Found {n_nodes} nodes on each axis -> {n_nodes - 1} segment pairs")
-
-    boundary_pairs = []
-    for i in range(n_nodes - 1):
-        # X-axis segment
-        x1_x, _ = x_axis_nodes[i]
-        x2_x, _ = x_axis_nodes[i + 1]
-
-        # Y-axis segment
-        _, y1_y = y_axis_nodes[i]
-        _, y2_y = y_axis_nodes[i + 1]
-
-        # Scale to mm
-        x1_mm = x1_x * scale
-        x2_mm = x2_x * scale
-        y1_mm = y1_y * scale
-        y2_mm = y2_y * scale
-
-        # Verify lengths match (should be identical due to mesh mirroring)
-        len_x = abs(x2_mm - x1_mm)
-        len_y = abs(y2_mm - y1_mm)
-        if abs(len_x - len_y) > 0.01:  # 0.01mm tolerance
-            print(f"        WARNING: Segment {i+1} length mismatch: X={len_x:.3f}, Y={len_y:.3f}")
-
-        boundary_pairs.append({
-            "name": f"boundary_side_{i+1}",
-            "x_axis": {
-                "x1": x1_mm, "y1": 0.0,
-                "x2": x2_mm, "y2": 0.0
-            },
-            "y_axis": {
-                "x1": 0.0, "y1": y1_mm,
-                "x2": 0.0, "y2": y2_mm
-            }
-        })
-
-    return boundary_pairs
-
-
-def save_centroids_json(out_path: str, air_centroids: List, iron_centroids: List,
-                        boundary_pairs: List = None):
-    """Save centroids and boundary info to JSON for FEMM."""
+def save_centroids_json(out_path: str, air_centroids: List, iron_centroids: List):
+    """Save centroids to JSON for FEMM (full model - no boundaries needed)."""
     data = {
         "air": [{"x": x, "y": y} for x, y in air_centroids],
         "iron": [{"x": x, "y": y} for x, y in iron_centroids],
-        "boundaries": boundary_pairs or [],
         "scale": DXF_SCALE,
-        "note": "Coordinates in mm (scaled)."
+        "note": "Coordinates in mm (scaled). Full model - no boundary conditions."
     }
     with open(out_path, "w") as f:
         json.dump(data, f, indent=2)
-    n_bounds = len(boundary_pairs) if boundary_pairs else 0
-    print(f"  Wrote: {out_path} (AIR: {len(air_centroids)}, IRON: {len(iron_centroids)}, Boundaries: {n_bounds})")
+    print(f"  Wrote: {out_path} (AIR: {len(air_centroids)}, IRON: {len(iron_centroids)})")
 
 
 # ============================================================================
@@ -641,8 +527,9 @@ def get_ngnet_size(tra_path: str, n_radial: int = 6, n_angular: int = 5) -> int:
 def _build_geometry(elements, nodes, ngnet, output_dir, verbose, output_prefix=None) -> Tuple[str, str]:
     """Internal function để build geometry từ ngnet đã có weights.
 
-    Quy trình đúng: Mirror MESH trước, rồi mới tạo polygon.
-    Điều này đảm bảo đường biên X-axis và Y-axis hoàn toàn đối xứng.
+    Quy trình:
+    1. Mesh gốc 0-45° → mirror qua y=x → 0-90° (1/4 model)
+    2. Rotate 1/4 model 3 lần (90°, 180°, 270°) → full model (0-360°)
 
     Args:
         output_prefix: prefix cho tên file (để chạy song song). Mặc định "combined_regions"
@@ -661,20 +548,44 @@ def _build_geometry(elements, nodes, ngnet, output_dir, verbose, output_prefix=N
 
     # Mirror mesh (0-45° → 45-90°) - material được copy từ original
     if verbose:
-        print("\n3. Mirroring mesh to create symmetric 0-90° mesh...")
+        print("\n3. Mirroring mesh to create symmetric 0-90° mesh (1/4 model)...")
     mirrored_nodes, mirrored_elements = mirror_mesh(nodes, elements)
     if verbose:
         print(f"   Mirrored mesh: {len(mirrored_nodes)} nodes, {len(mirrored_elements)} elements")
 
-    # Combine original + mirrored mesh
-    combined_nodes = {**nodes, **mirrored_nodes}
-    combined_elements = elements + mirrored_elements
+    # Combine original + mirrored mesh = 1/4 model (0-90°)
+    quarter_nodes = {**nodes, **mirrored_nodes}
+    quarter_elements = elements + mirrored_elements
     if verbose:
-        print(f"   Combined mesh: {len(combined_nodes)} nodes, {len(combined_elements)} elements")
+        print(f"   1/4 model mesh: {len(quarter_nodes)} nodes, {len(quarter_elements)} elements")
 
-    # Convert to polygons (từ combined mesh 0-90°)
+    # Rotate 1/4 model 3 lần để tạo full model
     if verbose:
-        print("\n4. Building polygons from combined mesh...")
+        print("\n4. Rotating 1/4 model to create full model (0-360°)...")
+
+    max_node_id = max(quarter_nodes.keys())
+    max_elem_id = len(quarter_elements)
+
+    combined_nodes = dict(quarter_nodes)
+    combined_elements = list(quarter_elements)
+
+    for i, angle in enumerate([90, 180, 270], start=1):
+        node_offset = max_node_id * i
+        elem_offset = max_elem_id * i
+        rotated_nodes, rotated_elements = rotate_mesh(
+            quarter_nodes, quarter_elements, angle, node_offset, elem_offset
+        )
+        combined_nodes.update(rotated_nodes)
+        combined_elements.extend(rotated_elements)
+        if verbose:
+            print(f"   Rotated {angle}°: +{len(rotated_nodes)} nodes, +{len(rotated_elements)} elements")
+
+    if verbose:
+        print(f"   Full model mesh: {len(combined_nodes)} nodes, {len(combined_elements)} elements")
+
+    # Convert to polygons (từ full model mesh)
+    if verbose:
+        print("\n5. Building polygons from full model mesh...")
     iron_polys = []
     air_polys = []
     all_polys = []
@@ -690,7 +601,7 @@ def _build_geometry(elements, nodes, ngnet, output_dir, verbose, output_prefix=N
 
     # Merge polygons
     if verbose:
-        print("\n5. Merging polygons...")
+        print("\n6. Merging polygons...")
 
     # Total region (all elements)
     if verbose:
@@ -743,15 +654,15 @@ def _build_geometry(elements, nodes, ngnet, output_dir, verbose, output_prefix=N
 
     # Export combined DXF
     if verbose:
-        print("\n6. Exporting DXF and centroids...")
+        print("\n7. Exporting DXF and centroids...")
     dxf_path = os.path.join(output_dir, f"{output_prefix}.dxf")
     json_path = os.path.join(output_dir, f"{output_prefix}.json")
 
     write_combined_dxf(dxf_path, {"AIR": air_list, "IRON": iron_list})
 
-    # Compute centroids using combined element centroids
+    # Compute centroids using full model element centroids
     if verbose:
-        print("   Computing block label positions from combined mesh elements...")
+        print("   Computing block label positions from full model mesh elements...")
     air_elem_centroids = get_element_centroids(combined_elements, combined_nodes, DXF_SCALE, Material.AIR)
     iron_elem_centroids = get_element_centroids(combined_elements, combined_nodes, DXF_SCALE, Material.IRON)
 
@@ -759,18 +670,12 @@ def _build_geometry(elements, nodes, ngnet, output_dir, verbose, output_prefix=N
     air_centroids = find_representative_points(air_list, air_elem_centroids)
     iron_centroids = find_representative_points(iron_list, iron_elem_centroids)
 
-    # Create boundary segments from COMBINED mesh (đảm bảo symmetric)
-    if verbose:
-        print("   Creating boundary segments from combined mesh corner nodes...")
-    boundary_pairs = create_boundary_segments_symmetric(combined_elements, combined_nodes, DXF_SCALE)
-    if verbose:
-        print(f"   -> Created {len(boundary_pairs)} boundary segment pair(s)")
-
-    save_centroids_json(json_path, air_centroids, iron_centroids, boundary_pairs)
+    # Full model - không cần boundary conditions
+    save_centroids_json(json_path, air_centroids, iron_centroids)
 
     # Visualization (only when verbose)
     if verbose:
-        print("\n7. Creating preview...")
+        print("\n8. Creating preview...")
         try:
             import matplotlib
             matplotlib.use("Agg")

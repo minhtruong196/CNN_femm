@@ -402,7 +402,7 @@ def main():
     """Main function để chạy GA optimization."""
     # Paths
     tra_path = "rotor_2.TRA"
-    base_fem = "basic.FEM"
+    base_fem = "basic_full.FEM"
     output_dir = "ga_output"  # Thư mục chứa tất cả file output
 
     # Tạo thư mục output nếu chưa có

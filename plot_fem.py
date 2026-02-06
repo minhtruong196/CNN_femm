@@ -75,10 +75,8 @@ def setup_model(
 
     air_points = centroids_data.get("air", [])
     iron_points = centroids_data.get("iron", [])
-    boundary_pairs = centroids_data.get("boundaries", [])
     if verbose:
         print(f"  AIR: {len(air_points)} points, IRON: {len(iron_points)} points")
-        print(f"  Boundaries: {len(boundary_pairs)} pairs")
 
     # Mở FEMM
     ensure_femm_open()
@@ -117,32 +115,7 @@ def setup_model(
         femm.mi_setblockprop("M350_50A", 0, 4, "<None>", 0, 2, 0)
         femm.mi_clearselected()
 
-    # Tạo Anti-periodic boundary conditions
-    if boundary_pairs and verbose:
-        print(f"Creating anti-periodic boundaries ({len(boundary_pairs)} pairs)...")
-    for pair in boundary_pairs:
-        name = pair["name"]
-        femm.mi_addboundprop(name, 0, 0, 0, 0, 0, 0, 0, 0, 5)
-
-        edge_x = pair["x_axis"]
-        mid_x = (edge_x["x1"] + edge_x["x2"]) / 2
-        mid_y = (edge_x["y1"] + edge_x["y2"]) / 2
-        try:
-            femm.mi_selectsegment(mid_x, mid_y)
-            femm.mi_setsegmentprop(name, 0, 1, 0, 1)
-            femm.mi_clearselected()
-        except:
-            pass
-
-        edge_y = pair["y_axis"]
-        mid_x = (edge_y["x1"] + edge_y["x2"]) / 2
-        mid_y = (edge_y["y1"] + edge_y["y2"]) / 2
-        try:
-            femm.mi_selectsegment(mid_x, mid_y)
-            femm.mi_setsegmentprop(name, 0, 1, 0, 1)
-            femm.mi_clearselected()
-        except:
-            pass
+    # Full model - không cần boundary conditions
 
     # Lưu file mới
     femm.mi_saveas(str(output_fem))
@@ -258,7 +231,7 @@ def sweep_adv_for_max_torque(
 
 
 def create_model_with_rotor(
-    base_fem="basic.FEM",
+    base_fem="basic_full.FEM",
     rotor_dxf="combined_regions.dxf",
     centroids_json="centroids.json",
     output_fem=None,
@@ -289,9 +262,7 @@ def create_model_with_rotor(
 
     air_points = centroids_data.get("air", [])
     iron_points = centroids_data.get("iron", [])
-    boundary_pairs = centroids_data.get("boundaries", [])
     print(f"  AIR: {len(air_points)} points, IRON: {len(iron_points)} points")
-    print(f"  Boundaries: {len(boundary_pairs)} pairs")
 
     # Mở FEMM
     print("Opening FEMM...")
@@ -346,42 +317,7 @@ def create_model_with_rotor(
         femm.mi_setblockprop("M350_50A", 0, 4, "<None>", 0, 2, 0)
         femm.mi_clearselected()
 
-    # Tạo Anti-periodic boundary conditions
-    # Mỗi cặp segment (trên X-axis và Y-axis) có boundary property riêng
-    if boundary_pairs:
-        print(f"Creating anti-periodic boundaries ({len(boundary_pairs)} pairs)...")
-        for pair in boundary_pairs:
-            name = pair["name"]
-            # Tạo boundary property (BdryFormat=5 = Anti-periodic)
-            femm.mi_addboundprop(name, 0, 0, 0, 0, 0, 0, 0, 0, 5)
-
-            # Select segment trên trục X - dùng midpoint của segment
-            edge_x = pair["x_axis"]
-            mid_x = (edge_x["x1"] + edge_x["x2"]) / 2
-            mid_y = (edge_x["y1"] + edge_x["y2"]) / 2
-            try:
-                femm.mi_selectsegment(mid_x, mid_y)
-                femm.mi_setsegmentprop(name, 0, 1, 0, 1)
-                femm.mi_clearselected()
-                ok_x = True
-            except:
-                ok_x = False
-
-            # Select segment trên trục Y - dùng midpoint của segment
-            edge_y = pair["y_axis"]
-            mid_x = (edge_y["x1"] + edge_y["x2"]) / 2
-            mid_y = (edge_y["y1"] + edge_y["y2"]) / 2
-            try:
-                femm.mi_selectsegment(mid_x, mid_y)
-                femm.mi_setsegmentprop(name, 0, 1, 0, 1)
-                femm.mi_clearselected()
-                ok_y = True
-            except:
-                ok_y = False
-
-            status_x = "OK" if ok_x else "FAIL"
-            status_y = "OK" if ok_y else "FAIL"
-            print(f"    {name}: X-axis={status_x}, Y-axis={status_y}")
+    # Full model - không cần boundary conditions
 
     # Zoom fit và refresh
     femm.mi_zoomnatural()
@@ -393,7 +329,6 @@ def create_model_with_rotor(
     print(f"\nDa tao file moi: {output_fem}")
     print(f"  - AIR blocks: {len(air_points)}")
     print(f"  - IRON blocks: {len(iron_points)} (M350_50A, mesh=4)")
-    print(f"  - Anti-periodic boundaries: {len(boundary_pairs)}")
 
     # Chạy analyze và tính torque cho group 2
     print("\n=== TINH TORQUE ===")
@@ -481,7 +416,7 @@ def evaluate_individual_worker(args):
 
 if __name__ == "__main__":
     output_file, torque = create_model_with_rotor(
-        base_fem="basic.FEM",
+        base_fem="basic_full.FEM",
         rotor_dxf="combined_regions.dxf",
         centroids_json="centroids.json",
     )
